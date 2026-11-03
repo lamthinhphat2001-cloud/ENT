@@ -20,17 +20,17 @@ class Speech_Pretrain_Model(nn.Module):
         self.epoch = 0
 
         if pretrain == 'hubert':
-            config = HubertConfig.from_pretrained("facebook/hubert-base-ls960", output_hidden_states=~finetune)
+            config = HubertConfig.from_pretrained("facebook/hubert-base-ls960", output_hidden_states=not finetune)
             config.update(configmap)
             self.pretrain = HubertModel.from_pretrained("facebook/hubert-base-ls960", config=config)
 
         elif pretrain == 'wav2vec2':
-            config = Wav2Vec2Config.from_pretrained("facebook/wav2vec2-base", output_hidden_states=~finetune)
+            config = Wav2Vec2Config.from_pretrained("facebook/wav2vec2-base", output_hidden_states=not finetune)
             config.update(configmap)
             self.pretrain = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base", config=config)
             
         elif pretrain == 'wavlm':
-            config = WavLMConfig.from_pretrained("microsoft/wavlm-base", output_hidden_states=~finetune)
+            config = WavLMConfig.from_pretrained("microsoft/wavlm-base", output_hidden_states=not finetune)
             config.update(configmap)
             self.pretrain = WavLMModel.from_pretrained("microsoft/wavlm-base", config=config)
 
