@@ -137,6 +137,10 @@ _C.SEED = 42
 _C.LOCAL_RANK = 0
 # fold validation
 _C.NUM_FOLD = 5
+# folds to run in this session, empty means all folds
+_C.FOLDS = []
+# checkpoint to resume training from
+_C.RESUME = ''
 
 
 def Update(config, args):
@@ -174,6 +178,14 @@ def Update(config, args):
         config.LOCAL_RANK = int(args.gpu)
     if args.seed:
         config.SEED = args.seed
+    if args.save_path:
+        config.MODEL.SAVE_PATH = args.save_path
+        config.MODEL.SAVE = True
+    if args.resume:
+        config.RESUME = args.resume
+        config.MODEL.SAVE = True
+    if args.folds:
+        config.FOLDS = [int(fold) for fold in args.folds.split(',')]
     config.freeze()
 
 

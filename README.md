@@ -93,6 +93,19 @@ python main.py --model ent --headw 0.5 --rnntw 0.5 --jointw 0.5 --bpe_mode char 
 python main.py --model fent --headw 0.5 --rnntw 0.5 --jointw 0.5 --bpe_mode char --sed
 ```
 
+### Checkpoints and resuming
+
+Training is 5 folds of 50 epochs, so it can be split across sessions (e.g. the Kaggle time limit). Pass `--save_path` to write `<name>_last.pth` after every epoch, next to the best weights `<name>_<fold>.pth`. Use `--folds` to choose what runs in a session and `--resume` to continue. Finished fold results travel in the checkpoint, so the last summary covers all folds.
+
+```bash
+# Session 1
+python main.py --model ent --headw 0.5 --rnntw 0.5 --jointw 0.5 --bpe_mode char --folds 1,2 --save_path /kaggle/working/pth
+# Session 2, with the output of session 1 attached as input
+python main.py --model ent --headw 0.5 --rnntw 0.5 --jointw 0.5 --bpe_mode char --folds 3,4 --save_path /kaggle/working/pth --resume /kaggle/input/<session-1>/pth/<name>_last.pth
+```
+
+Use the same training arguments when resuming. A fold interrupted mid-way continues from its last finished epoch and must be included in `--folds`.
+
 ### Specification of Key Arguments
 
 * `--model`: the model chosen for training. Note we take the pretrained model as feature extractor in our paper and the output is the trainable weighted sum from multiple transformer layers.

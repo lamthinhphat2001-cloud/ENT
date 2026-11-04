@@ -1,6 +1,8 @@
 # The code architectue is adopted from https://github.com/microsoft/Swin-Transformer
 import os
 import sys
+import glob
+import shutil
 import logging
 import argparse
 import numpy as np
@@ -47,6 +49,9 @@ def parse_option():
     parser.add_argument('--finetune', action='store_true', help='whether to finetune or feature extraction')
     parser.add_argument('--gpu', type=str, help='gpu rank to use')
     parser.add_argument('--seed', type=int, help='seed')
+    parser.add_argument('--save_path', type=str, help='directory for checkpoints, enables saving')
+    parser.add_argument('--resume', type=str, help='path to a *_last.pth checkpoint to resume from, enables saving')
+    parser.add_argument('--folds', type=str, help='comma-separated folds to run in this session, e.g. 1,2')
 
     args, unparsed = parser.parse_known_args()
     config = get_config(args)
@@ -54,38 +59,103 @@ def parse_option():
 
 
 def main(config):
-    result = []
+    state, results = load_checkpoint(config)
+    prepare_save_path(config)
+
+    folds = [1] if config.DATA.SED else list(config.FOLDS) or list(range(1, config.NUM_FOLD + 1))
+    if not config.DATA.SED and not set(folds) <= set(range(1, config.NUM_FOLD + 1)):
+        raise ValueError(f'--folds must be between 1 and {config.NUM_FOLD}, got {folds}')
+
+    if state:
+        if state['fold'] in results:
+            set_rng_state(state)
+        elif state['fold'] in folds:
+            # Later folds overwrite the checkpoint, so finish the interrupted fold first.
+            folds.sort(key=lambda fold: fold != state['fold'])
+        else:
+            raise ValueError(f"Checkpoint has fold {state['fold']} in progress, include it in --folds or its progress is lost")
+
+    for ith_fold in folds:
+        if ith_fold in results:
+            logger.info(f'Skip fold {ith_fold}, already finished in the checkpoint')
+            continue
+        fold_state = state if state and state['fold'] == ith_fold else None
+        results[ith_fold] = solve(config, ith_fold, results, fold_state)
+
     if not config.DATA.SED:
-        for ith_fold in range(1, config.NUM_FOLD + 1):
-            WA, UA, WER, CER = solve(config, ith_fold)
-            result.append([WA, UA, WER, CER])
-        result = np.array(result)
-        logger.info('#' * 30 + f'  Summary  ' + '#' * 30)
-        logger.info('\n')
-        logger.info('fold\tWER\tCER\t')
-        for ith_fold in range(1, config.NUM_FOLD + 1):
-            WER, CER = result[ith_fold - 1,2], result[ith_fold - 1,3]
-            logger.info(f'{ith_fold}\t{WER:.2f}\t{CER:.2f}')
-        WER_mean = np.mean(result[:, 2])
-        CER_mean = np.mean(result[:, 3])
-        logger.info('Avg_WER\tAvg_CER')
-        logger.info(f'{WER_mean:.2f}\t{CER_mean:.2f}')
-        logger.info('\n')
-
-        logger.info('fold\tWA\tUA\t')
-        for ith_fold in range(1, config.NUM_FOLD + 1):
-            WA, UA = result[ith_fold - 1,0], result[ith_fold - 1,1]
-            logger.info(f'{ith_fold}\t{WA:.2f}\t{UA:.2f}')
-        WA_mean = np.mean(result[:, 0])
-        UA_mean = np.mean(result[:, 1])
-        logger.info('Avg_WA\tAvg_UA')
-        logger.info(f'{WA_mean:.2f}\t{UA_mean:.2f}')
-    else:
-        solve(config)
-    
+        log_summary(config, results)
 
 
-def solve(config, ith_fold=1):
+def log_summary(config, results):
+    finished = sorted(results)
+    result = np.array([results[ith_fold] for ith_fold in finished])
+    logger.info('#' * 30 + f'  Summary  ' + '#' * 30)
+    if len(finished) < config.NUM_FOLD:
+        logger.info(f'Partial summary: {len(finished)} of {config.NUM_FOLD} folds finished, resume to run the rest')
+    logger.info('\n')
+    logger.info('fold\tWER\tCER\t')
+    for ith_fold, (WA, UA, WER, CER) in zip(finished, result):
+        logger.info(f'{ith_fold}\t{WER:.2f}\t{CER:.2f}')
+    WER_mean = np.mean(result[:, 2])
+    CER_mean = np.mean(result[:, 3])
+    logger.info('Avg_WER\tAvg_CER')
+    logger.info(f'{WER_mean:.2f}\t{CER_mean:.2f}')
+    logger.info('\n')
+
+    logger.info('fold\tWA\tUA\t')
+    for ith_fold, (WA, UA, WER, CER) in zip(finished, result):
+        logger.info(f'{ith_fold}\t{WA:.2f}\t{UA:.2f}')
+    WA_mean = np.mean(result[:, 0])
+    UA_mean = np.mean(result[:, 1])
+    logger.info('Avg_WA\tAvg_UA')
+    logger.info(f'{WA_mean:.2f}\t{UA_mean:.2f}')
+
+
+def last_checkpoint_path(config):
+    return f'{config.MODEL.SAVE_PATH}/{config.MODEL.NAME}_last.pth'
+
+
+def atomic_save(obj, path):
+    # A session killed mid-write must not destroy the previous good file.
+    torch.save(obj, path + '.tmp')
+    os.replace(path + '.tmp', path)
+
+
+def load_checkpoint(config):
+    """Return the checkpoint to resume from and the results of its finished folds."""
+    if not config.RESUME:
+        return None, {}
+    state = torch.load(config.RESUME, map_location='cpu')
+    if state['name'] != config.MODEL.NAME:
+        raise ValueError(f"Checkpoint was trained as {state['name']}, but this run is {config.MODEL.NAME}")
+    results = state['results']
+    if state['epoch'] + 1 >= config.TRAIN.EPOCHS:
+        results[state['fold']] = [state['meter'][key] for key in ('WA', 'UA', 'WER', 'CER')]
+    logger.info(f"Resume from {config.RESUME}: fold {state['fold']}, epoch {state['epoch']}, finished folds {sorted(results)}")
+    return state, results
+
+
+def prepare_save_path(config):
+    if not config.MODEL.SAVE:
+        return
+    os.makedirs(config.MODEL.SAVE_PATH, exist_ok=True)
+    last_path = last_checkpoint_path(config)
+    if os.path.exists(last_path) and not (config.RESUME and os.path.samefile(config.RESUME, last_path)):
+        raise FileExistsError(f'{last_path} would be overwritten, resume from it with --resume or move it away')
+    if config.RESUME:
+        # Carry the best weights forward, so the latest session output holds all of them.
+        for path in glob.glob(f'{os.path.dirname(config.RESUME) or "."}/{config.MODEL.NAME}_*.pth'):
+            target = os.path.join(config.MODEL.SAVE_PATH, os.path.basename(path))
+            if not path.endswith('_last.pth') and not os.path.exists(target):
+                shutil.copy(path, target)
+
+
+def set_rng_state(state):
+    torch.set_rng_state(state['rng'])
+    torch.cuda.set_rng_state(state['cuda_rng'])
+
+
+def solve(config, ith_fold=1, results=None, state=None):
     dataloader_train, dataloader_test = build_loader(config, ith_fold=ith_fold)
     model = build_model(config)
     model.cuda()
@@ -116,7 +186,19 @@ def solve(config, ith_fold=1):
     logger.info('#' * 30 + '  Start Training  ' + '#' * 30)
     Meter = IEMOCAP_Meter()
 
-    for epoch in range(config.TRAIN.EPOCHS):
+    start_epoch = 0
+    if state:
+        model.load_state_dict(state['model'])
+        optimizer.load_state_dict(state['optimizer'])
+        lr_scheduler.load_state_dict(state['lr_scheduler'])
+        vars(Meter).update(state['meter'])
+        start_epoch = state['epoch'] + 1
+        if config.TRAIN.FINETUNE:
+            for _ in range(start_epoch):
+                model.encoder.speech_pretrain_model.set_num_updates()
+        set_rng_state(state)
+
+    for epoch in range(start_epoch, config.TRAIN.EPOCHS):
         logger.info(f'>> epoch {epoch}')
         train_loss = train_one_epoch(config, model, dataloader_train, optimizer, epoch, lr_scheduler)
 
@@ -126,16 +208,29 @@ def solve(config, ith_fold=1):
             test_loss, WA, UA, WER, CER = validate(config, dataloader_test, model, symbol_table, bpe_model)
             logger.info(f'train loss: {train_loss:.2f}, test loss: {test_loss:.2f}, WER: {WER:.2f}, CER: {CER:.2f}, WA: {WA:.2f}, UA: {UA:.2f}')
             if Meter.UA < UA and config.MODEL.SAVE:
-                torch.save(model.state_dict(), f'{config.MODEL.SAVE_PATH}/{config.MODEL.NAME}_{ith_fold}.pth')
+                atomic_save(model.state_dict(), f'{config.MODEL.SAVE_PATH}/{config.MODEL.NAME}_{ith_fold}.pth')
             Meter.update(WA, UA, WER, CER)
         else:
             test_loss, WA, UA, WER, CER, eder = validate_sed(config, dataloader_test, model, symbol_table, bpe_model)
             logger.info(f'train loss: {train_loss:.2f}, test loss: {test_loss:.2f}, WER: {WER:.2f}, CER: {CER:.2f}, WA: {WA:.2f}, UA: {UA:.2f}, EDER: {eder:.2f}')
             if Meter.WA < WA and config.MODEL.SAVE:
-                torch.save(model.state_dict(), f'{config.MODEL.SAVE_PATH}/{config.MODEL.NAME}_WA.pth')
+                atomic_save(model.state_dict(), f'{config.MODEL.SAVE_PATH}/{config.MODEL.NAME}_WA.pth')
             if Meter.eder > eder and config.MODEL.SAVE:
-                torch.save(model.state_dict(), f'{config.MODEL.SAVE_PATH}/{config.MODEL.NAME}_EDER.pth')
+                atomic_save(model.state_dict(), f'{config.MODEL.SAVE_PATH}/{config.MODEL.NAME}_EDER.pth')
             Meter.update(WA, UA, WER, CER, eder)
+        if config.MODEL.SAVE:
+            atomic_save({
+                'name': config.MODEL.NAME,
+                'fold': ith_fold,
+                'epoch': epoch,
+                'results': results,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': lr_scheduler.state_dict(),
+                'meter': {key: float(value) for key, value in vars(Meter).items()},
+                'rng': torch.get_rng_state(),
+                'cuda_rng': torch.cuda.get_rng_state(),
+            }, last_checkpoint_path(config))
     logger.info('#' * 30 + f'  Summary fold{ith_fold}  ' + '#' * 30)
     logger.info(f'MAX_WA: {Meter.WA:.2f}')
     logger.info(f'MAX_UA: {Meter.UA:.2f}')
@@ -143,7 +238,7 @@ def solve(config, ith_fold=1):
     logger.info(f'MIN_CER: {Meter.CER:.2f}')
     if config.DATA.SED:
         logger.info(f'MIN_EDER: {Meter.eder:.2f}')
-    return Meter.WA, Meter.UA, Meter.WER, Meter.CER
+    return [float(Meter.WA), float(Meter.UA), float(Meter.WER), float(Meter.CER)]
 
 
 def train_one_epoch(config, model, dataloader, optimizer, epoch, lr_scheduler):
